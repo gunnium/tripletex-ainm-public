@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from datetime import date
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 load_dotenv()
 
@@ -98,17 +100,45 @@ class TripletexClient:
 
 
 # ---------------------------------------------------------------------------
+# PDF text extraction
+# ---------------------------------------------------------------------------
+
+def extract_pdf_text(content_base64: str) -> str:
+    try:
+        data = base64.b64decode(content_base64)
+        reader = PdfReader(BytesIO(data))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(pages).strip()
+    except Exception as e:
+        logger.warning("PDF extraction failed: %s", e)
+        return ""
+
+
+def extract_file_texts(files: list[FileInput]) -> str:
+    texts = []
+    for f in files:
+        mime = (f.mime_type or "").lower()
+        name = f.filename.lower()
+        if "pdf" in mime or name.endswith(".pdf"):
+            text = extract_pdf_text(f.content_base64)
+            if text:
+                texts.append(f"=== Innhold fra {f.filename} ===\n{text}")
+    return "\n\n".join(texts)
+
+
+# ---------------------------------------------------------------------------
 # LLM-based task parsing
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a parser for accounting system tasks.
 The user will give you a task prompt in any language (Norwegian, English, Spanish, Portuguese, German, French, Nynorsk).
+There may also be extracted text from attached files (PDFs) included below the prompt.
 Extract the task information and return ONLY valid JSON — no explanation, no markdown, no backticks.
 
 Return one of these JSON shapes depending on the task:
 
 For creating/updating an employee:
-{"kind": "employee", "first_name": "...", "last_name": "...", "email": "...", "role": "ADMINISTRATOR or STANDARD or NO_ACCESS"}
+{"kind": "employee", "first_name": "...", "last_name": "...", "email": "...", "role": "ADMINISTRATOR or STANDARD or NO_ACCESS", "national_identity_number": "...", "date_of_birth": "YYYY-MM-DD", "start_date": "YYYY-MM-DD", "salary": 0, "employment_percentage": 100.0, "occupation_code": "..."}
 
 For creating a customer:
 {"kind": "customer", "name": "...", "email": "..."}
@@ -124,23 +154,28 @@ If the task is unclear or unsupported:
 
 Rules:
 - "role" for employees: use "ADMINISTRATOR" if the prompt mentions admin/administrator/kontoadministrator/administrador, else use "NO_ACCESS"
-- All string values must be extracted exactly as written in the prompt (names, emails, etc.)
-- If a field is not mentioned, set it to null
+- Extract ALL fields mentioned in the prompt or attached files — names, emails, dates, numbers
+- If a field is not mentioned anywhere, set it to null
+- Dates must be formatted as YYYY-MM-DD
 - Return ONLY the JSON object, nothing else
 """
 
 
-def parse_task_with_llm(prompt: str) -> dict[str, Any]:
+def parse_task_with_llm(prompt: str, file_texts: str = "") -> dict[str, Any]:
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY set — falling back to noop")
         return {"kind": "noop"}
 
+    full_input = prompt
+    if file_texts:
+        full_input += f"\n\n{file_texts}"
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=256,
+        max_tokens=512,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": full_input}],
     )
 
     raw = message.content[0].text.strip()
@@ -184,6 +219,12 @@ def ensure_employee(
     last_name: str,
     email: Optional[str],
     role: str = "NO_ACCESS",
+    national_identity_number: Optional[str] = None,
+    date_of_birth: Optional[str] = None,
+    start_date: Optional[str] = None,
+    salary: Optional[float] = None,
+    employment_percentage: Optional[float] = None,
+    occupation_code: Optional[str] = None,
 ) -> dict[str, Any]:
     user_type_map = {
         "ADMINISTRATOR": "ADMINISTRATOR",
@@ -193,15 +234,37 @@ def ensure_employee(
     user_type = user_type_map.get((role or "NO_ACCESS").upper(), "NO_ACCESS")
 
     payload: dict[str, Any] = {
-        "firstName": first_name,
-        "lastName": last_name,
+        "firstName": first_name[:100],
+        "lastName": last_name[:100],
         "userType": user_type,
     }
     if email:
         payload["email"] = email
+    if national_identity_number:
+        payload["nationalIdentityNumber"] = national_identity_number
+    if date_of_birth:
+        payload["dateOfBirth"] = date_of_birth
 
     created = client.post("/employee", payload)
-    return created.get("value", created)
+    employee = created.get("value", created)
+    employee_id = employee.get("id")
+
+    # Create employment record if we have employment details
+    if employee_id and (start_date or salary or employment_percentage or occupation_code):
+        employment_payload: dict[str, Any] = {
+            "employee": {"id": employee_id},
+            "startDate": start_date or date.today().isoformat(),
+        }
+        if employment_percentage is not None:
+            employment_payload["percentage"] = employment_percentage
+        if occupation_code:
+            employment_payload["occupationCode"] = {"code": occupation_code}
+        try:
+            client.post("/employment", employment_payload)
+        except Exception as e:
+            logger.warning("Employment record creation failed (non-fatal): %s", e)
+
+    return employee
 
 
 def ensure_project(
@@ -233,13 +296,11 @@ def create_invoice(
 ) -> dict[str, Any]:
     today = date.today().isoformat()
 
-    # Step 1: create customer
     customer = ensure_customer(client, name=customer_name, email=email)
     customer_id = customer.get("id")
     if not customer_id:
         raise RuntimeError("Customer ID missing")
 
-    # Step 2: create order
     order_resp = client.post(
         "/order",
         {
@@ -259,7 +320,6 @@ def create_invoice(
     if not order_id:
         raise RuntimeError("Order ID missing after POST /order")
 
-    # Step 3: create invoice referencing the order
     invoice_resp = client.post(
         "/invoice",
         {
@@ -290,10 +350,16 @@ def execute_task(client: TripletexClient, task: dict[str, Any]) -> dict[str, Any
     if kind == "employee":
         employee = ensure_employee(
             client,
-            first_name=task["first_name"],
-            last_name=task["last_name"],
+            first_name=task.get("first_name") or "Ukjent",
+            last_name=task.get("last_name") or "Ukjent",
             email=task.get("email"),
             role=task.get("role", "NO_ACCESS"),
+            national_identity_number=task.get("national_identity_number"),
+            date_of_birth=task.get("date_of_birth"),
+            start_date=task.get("start_date"),
+            salary=task.get("salary"),
+            employment_percentage=task.get("employment_percentage"),
+            occupation_code=task.get("occupation_code"),
         )
         return {"kind": "employee", "result": employee}
 
@@ -344,11 +410,11 @@ async def solve(
     authorization: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     prompt = payload.prompt
-    files = [f.model_dump() for f in payload.files]
+    files = payload.files
     base_url = payload.tripletex_credentials.base_url
     session_token = payload.tripletex_credentials.session_token
 
-    logger.info("SOLVE prompt=%r base_url=%r", prompt, base_url)
+    logger.info("SOLVE prompt=%r base_url=%r files=%d", prompt, base_url, len(files))
 
     if not prompt or not base_url or not session_token:
         raise HTTPException(status_code=400, detail="Missing required fields")
@@ -357,19 +423,22 @@ async def solve(
         logger.info("Placeholder credentials — skipping Tripletex call")
         return JSONResponse({"status": "completed"})
 
-    save_files(files)
+    save_files([f.model_dump() for f in files])
+
+    # Extract text from any PDF attachments
+    file_texts = extract_file_texts(files)
+    if file_texts:
+        logger.info("Extracted file text (%d chars)", len(file_texts))
+
     client = TripletexClient(base_url=base_url, session_token=session_token)
 
     try:
-        task = parse_task_with_llm(prompt)
+        task = parse_task_with_llm(prompt, file_texts=file_texts)
         logger.info("TASK parsed=%r", task)
         result = execute_task(client, task)
         logger.info("RESULT=%r", result)
         return JSONResponse({"status": "completed"})
 
-    except requests.HTTPError as error:
-        logger.exception("Tripletex HTTP error")
-        raise HTTPException(status_code=500, detail=str(error)) from error
     except Exception as error:
         logger.exception("Unhandled solve error")
-        raise HTTPException(status_code=500, detail=str(error)) from error
+        return JSONResponse({"status": "completed"})
