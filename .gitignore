@@ -1,11 +1,18 @@
+# Python
 .venv/
 __pycache__/
-.DS_Store
-.env
-kommandoer.txt
-visma-terms-of-service-norsk.pdf
+*.pyc
+.pytest_cache/
 
-# Local logs / redacted logs
+# macOS
+.DS_Store
+
+# Secrets
+.env
+
+# Logs
 *.log
 *.redacted
-render.log
+
+# Local attachments / temp files
+attachments/
