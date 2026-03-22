@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.DS_Store
+.env
+kommandoer.txt
+visma-terms-of-service-norsk.pdf
+
+# Local logs / redacted logs
+*.log
+*.redacted
+render.log
